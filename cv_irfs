@@ -1,0 +1,472 @@
+# --- Packages: install quietly if needed, then load (atelier-friendly) ----
+pkgs <- c("tidyverse","lubridate","broom","sandwich","lmtest","BVAR","zoo","shiny","bslib","patchwork")
+need <- setdiff(pkgs, rownames(installed.packages()))
+if (length(need) > 0) install.packages(need, repos = "https://cloud.r-project.org", quiet = TRUE)
+invisible(lapply(pkgs, function(p) suppressPackageStartupMessages(library(p, character.only = TRUE))))
+
+# ============================================================
+# 0) DATA LOADING (OFFLINE SNAPSHOT) + BASIC UTILITIES
+# ============================================================
+
+# load FRED-QD snapshot from BVAR (offline)
+load_fred_qd <- function() {
+  x <- BVAR::fred_qd                        # zoo quarterly
+  idx <- zoo::index(x)                      # yearqtr
+  sasdate <- as.Date(idx, frac = 1)         # quarter-end Date
+  raw <- tibble::as_tibble(zoo::coredata(x)) %>%
+    mutate(sasdate = sasdate) %>%
+    relocate(sasdate) %>%
+    arrange(sasdate) %>%
+    # enforce one row per quarter (defensive)
+    distinct(sasdate, .keep_all = TRUE)
+  list(df = raw, source = "BVAR snapshot (offline)")
+}
+
+# Build CY_10Y (levels) robustly: AAA - GS10   or   AAAFF? + FEDFUNDS - GS10
+add_cy_spread <- function(df_raw) {
+  nm <- names(df_raw)
+  pick_first <- function(patterns) {
+    for (p in patterns) {
+      hit <- grep(p, nm, value = TRUE)
+      if (length(hit)) return(hit[1])
+    }
+    NA_character_
+  }
+  gs10 <- pick_first(c("^GS10$", "^G10$"))
+  aaa  <- pick_first(c("^AAA$"))
+  aaff <- pick_first(c("^AAAFFR$", "^AAAFFM$", "^AAAFF"))
+  if (is.na(gs10)) stop("Cannot find GS10 (10Y Treasury) in the snapshot.")
+  if (!is.na(aaa)) {
+    cy <- df_raw %>% transmute(sasdate, CY_10Y = .data[[aaa]] - .data[[gs10]])
+    lbl <- paste0(aaa, " − ", gs10)
+    return(list(cy = cy, label = lbl))
+  }
+  if (!is.na(aaff) && "FEDFUNDS" %in% nm) {
+    cy <- df_raw %>% transmute(sasdate, CY_10Y = .data[[aaff]] + FEDFUNDS - .data[[gs10]])
+    lbl <- paste0(aaff, " + FEDFUNDS − ", gs10, "  (≡ AAA − ", gs10, ")")
+    return(list(cy = cy, label = lbl))
+  }
+  stop("Cannot construct CY_10Y: need AAA & GS10, or AAAFF* with FEDFUNDS & GS10.")
+}
+
+# Offline external series: Net-Exports share = 100*(Exports - Imports)/GDP (choose real if available)
+get_nx_share_offline <- function(df_raw) {
+  nm <- names(df_raw)
+  pick_first <- function(patterns) { for (p in patterns) { hit <- grep(p, nm, value = TRUE); if (length(hit)) return(hit[1]) }; NA_character_ }
+  
+  # real series preferred
+  exp_r <- pick_first(c("^EXPGSC1$","^EXPGSC","^R?EXPGS"))
+  imp_r <- pick_first(c("^IMPGSC1$","^IMPGSC","^R?IMPGS"))
+  gdp_r <- pick_first(c("^GDPC1$","^GDPC"))
+  if (all(!is.na(c(exp_r, imp_r, gdp_r)))) {
+    df <- df_raw %>%
+      transmute(sasdate,
+                EXT_VAR = 100*((.data[[exp_r]] - .data[[imp_r]])/.data[[gdp_r]]))
+    return(list(df = df, label = "Net exports share (real, % of GDP)", source = "FRED‑QD snapshot"))
+  }
+  # fallback: nominal
+  exp_n <- pick_first(c("^EXPGS$","^EXPGS"))
+  imp_n <- pick_first(c("^IMPGS$","^IMPGS"))
+  gdp_n <- pick_first(c("^GDP$"))
+  if (all(!is.na(c(exp_n, imp_n, gdp_n)))) {
+    df <- df_raw %>%
+      transmute(sasdate,
+                EXT_VAR = 100*((.data[[exp_n]] - .data[[imp_n]])/.data[[gdp_n]]))
+    return(list(df = df, label = "Net exports share (nominal, % of GDP)", source = "FRED‑QD snapshot"))
+  }
+  NULL
+}
+
+# ============================================================
+# 1) SIMPLE, ROBUST TRANSFORMER (NO GLOBAL fred_transform)
+# ============================================================
+
+# Safe Δlog × 100 (percent): fallback to pct change if log invalid
+dlog_pct <- function(x) {
+  x <- as.numeric(x)
+  if (any(x <= 0, na.rm = TRUE) || any(!is.finite(x), na.rm = TRUE)) {
+    return(100 * (x / dplyr::lag(x) - 1))  # handles zeros
+  } else {
+    return(100 * (log(x) - dplyr::lag(log(x))))
+  }
+}
+
+# Heuristic stationarity: levels for rates/spreads/shares; Δlog for quantities/prices
+stationarize <- function(vec, name) {
+  nm <- toupper(name)
+  is_rate <- grepl("^(GS|TB|BAA|AAA|EFFR|FEDFUNDS|DFED|MORTG|CP|T[0-9]+Y|T[0-9]+M|BAAFF|AAAFF)", nm)
+  is_spread <- grepl("(SPREAD)$", nm)
+  is_unemp <- grepl("^UNRATE$", nm)
+  is_share <- grepl("(SHARE|RATIO|%|PCT)$", nm)
+  is_price <- grepl("(DEF|CPI|PCEPI|PCECTPI|GDPDEF|PPI)", nm)
+  is_quantity <- grepl("(GDPC|GDP\\b|INDPRO|IP|OUT|CONS|INV|HOURS|PAYEMS|EMP|INCOME|SALES)", nm)
+  
+  if (is_rate || is_spread || is_unemp || is_share) {
+    return(as.numeric(vec))                  # keep in levels
+  } else if (is_price || is_quantity) {
+    return(dlog_pct(vec))                    # Δlog × 100
+  } else {
+    # default: Δlog × 100 (safe)
+    return(dlog_pct(vec))
+  }
+}
+
+# ============================================================
+# 2) BUILD PANEL (raw) + SHOCK + EXTERNAL, ALL QUARTERLY
+# ============================================================
+
+prep_data <- function() {
+  L <- load_fred_qd()
+  raw  <- L$df                              # sasdate (Date), numeric columns
+  src  <- L$source
+  
+  # shock (levels)
+  shock <- add_cy_spread(raw)               # list(cy, label)
+  
+  # external (offline)
+  ext_try <- get_nx_share_offline(raw)
+  ext_avail  <- !is.null(ext_try)
+  ext_label  <- if (ext_avail) ext_try$label else "External series unavailable"
+  ext_source <- if (ext_avail) ext_try$source else "No NX/GDP combination found."
+  
+  # merge: raw + CY (by sasdate) + EXT (by sasdate)
+  df <- raw %>%
+    left_join(shock$cy, by = "sasdate")
+  if (ext_avail) df <- df %>% left_join(ext_try$df, by = "sasdate")
+  
+  # ensure numeric across board (some snapshots can carry weird types)
+  df <- df %>% mutate(across(-sasdate, ~ suppressWarnings(as.numeric(.))))
+  
+  # choices for y (all raw columns except date & derived)
+  choices <- setdiff(names(raw), "sasdate")
+  
+  # overlap diagnostics
+  shock_n <- sum(!is.na(df$CY_10Y))
+  ext_n   <- if ("EXT_VAR" %in% names(df)) sum(!is.na(df$EXT_VAR)) else 0
+  sample_info <- paste0("Quarters with CY shock: ", shock_n,
+                        if (ext_avail) paste0(" | External overlap: ", ext_n, " qtrs") else "")
+  
+  list(df = df,
+       choices = sort(choices),
+       source = src,
+       shock_label = shock$label,
+       ext_avail = ext_avail && ext_n >= 12,
+       ext_label  = if (ext_avail) paste0(ext_label, if (ext_n >= 12) paste0(" (", ext_n, " qtrs)") else " — insufficient overlap") else ext_label,
+       ext_source = ext_source,
+       sample_info = sample_info)
+}
+
+# ============================================================
+# 3) LOCAL PROJECTIONS (transform y/controls on the fly)
+# ============================================================
+
+safe_NeweyWest <- function(fit, h, prewhite) {
+  tryCatch(
+    sandwich::NeweyWest(fit, lag = max(h, 1), prewhite = prewhite, adjust = TRUE),
+    error = function(e) sandwich::NeweyWest(fit, lag = max(h, 1), prewhite = FALSE, adjust = TRUE)
+  )
+}
+
+lp_irf <- function(data_raw, y, shock = "CY_10Y",
+                   controls = c("GDPC1","GDPDEF","FEDFUNDS","UNRATE"),
+                   H = 16, p_lags = 4, q_lags = 4, c_lags = 4,
+                   cumulative = FALSE, nw_prewhite = FALSE,
+                   force_level_y = FALSE) {
+  
+  stopifnot(shock %in% names(data_raw))
+  controls <- intersect(controls, names(data_raw))
+  
+  # Build a working frame with just the needed columns
+  keep_names <- unique(c("sasdate", y, shock, controls))
+  W <- data_raw %>%
+    select(any_of(keep_names)) %>%
+    arrange(sasdate)
+  
+  # Transform y and controls
+  W[[y]] <- if (force_level_y) as.numeric(W[[y]]) else stationarize(W[[y]], y)
+  for (ctl in controls) W[[ctl]] <- stationarize(W[[ctl]], ctl)
+  
+  # Helper: add lags L1..Lk
+  add_lags <- function(df, var, L) {
+    for (i in seq_len(L)) df[[paste0("L", i, "_", var)]] <- dplyr::lag(df[[var]], i)
+    df
+  }
+  
+  # Base regression frame
+  base <- W %>%
+    mutate(.y = .data[[y]], .shock = .data[[shock]]) %>%
+    add_lags(y, p_lags) %>%
+    add_lags(shock, q_lags)
+  for (ctl in controls) base <- add_lags(base, ctl, c_lags)
+  
+  rhs_terms <- c(
+    shock,
+    paste0("L", seq_len(q_lags), "_", shock),
+    paste0("L", seq_len(p_lags), "_", y),
+    unlist(lapply(controls, function(ctl) paste0("L", seq_len(c_lags), "_", ctl)), use.names = FALSE)
+  )
+  
+  purrr::map_dfr(0:H, function(h) {
+    if (cumulative && h == 0) {
+      return(tibble(h = 0, beta = 0, se = 0, ci95_lo = 0, ci95_hi = 0, ci68_lo = 0, ci68_hi = 0))
+    }
+    
+    df_h <- base %>%
+      mutate(dep = if (cumulative) dplyr::lead(.y, h) - .y else dplyr::lead(.y, h)) %>%
+      select(dep, any_of(rhs_terms)) %>%
+      drop_na()
+    
+    if (nrow(df_h) < 10) {
+      return(tibble(h = h, beta = NA_real_, se = NA_real_,
+                    ci95_lo = NA_real_, ci95_hi = NA_real_,
+                    ci68_lo = NA_real_, ci68_hi = NA_real_))
+    }
+    
+    # drop zero-variance RHS columns (collinearity guard)
+    rhs_all <- setdiff(names(df_h), "dep")
+    sd_ok <- vapply(df_h[rhs_all], function(v) stats::sd(v, na.rm = TRUE) > 0, logical(1))
+    rhs_keep <- rhs_all[sd_ok]
+    if (!(shock %in% rhs_keep)) {
+      return(tibble(h = h, beta = NA_real_, se = NA_real_,
+                    ci95_lo = NA_real_, ci95_hi = NA_real_,
+                    ci68_lo = NA_real_, ci68_hi = NA_real_))
+    }
+    df_fit <- df_h %>% select(dep, any_of(rhs_keep))
+    
+    fml <- stats::as.formula(paste("dep ~", paste(setdiff(names(df_fit), "dep"), collapse = " + ")))
+    fit <- stats::lm(fml, data = df_fit)
+    
+    V  <- safe_NeweyWest(fit, h, prewhite = nw_prewhite)
+    ct <- lmtest::coeftest(fit, vcov. = V)
+    rn <- rownames(ct); idx <- match(shock, rn, nomatch = 0)
+    if (idx == 0) {
+      return(tibble(h = h, beta = NA_real_, se = NA_real_,
+                    ci95_lo = NA_real_, ci95_hi = NA_real_,
+                    ci68_lo = NA_real_, ci68_hi = NA_real_))
+    }
+    b <- unname(ct[idx, 1]); s <- unname(ct[idx, 2])
+    tibble(h = h, beta = b, se = s)
+  }) %>%
+    mutate(ci95_lo = ifelse(is.na(se), NA_real_, beta - 1.96 * se),
+           ci95_hi = ifelse(is.na(se), NA_real_, beta + 1.96 * se),
+           ci68_lo = ifelse(is.na(se), NA_real_, beta - 1.00 * se),
+           ci68_hi = ifelse(is.na(se), NA_real_, beta + 1.00 * se))
+}
+
+# ============================================================
+# 4) SHINY APP
+# ============================================================
+
+ui <- fluidPage(
+  theme = bslib::bs_theme(bootswatch = "flatly"),
+  titlePanel("Local Projections: Convenience Yield Shocks (AAA − GS10)"),
+  sidebarLayout(
+    sidebarPanel(
+      width = 4,
+      div(style="font-size:0.9em; padding:6px; background:#eef5ff; border-radius:6px; margin-bottom:6px;",
+          strong("Data source: "), textOutput("datasrc", inline = TRUE)),
+      div(style="font-size:0.9em; padding:6px; background:#f3fff0; border-radius:6px; margin-bottom:6px;",
+          strong("Shock formula: "), textOutput("shocklbl", inline = TRUE)),
+      div(style="font-size:0.9em; padding:6px; background:#fff7e6; border-radius:6px; margin-bottom:6px;",
+          strong("External channel: "), textOutput("extsrc", inline = TRUE)),
+      div(style="font-size:0.9em; padding:6px; background:#f0f5ff; border-radius:6px; margin-bottom:12px;",
+          strong("Sample: "), textOutput("samplestr", inline = TRUE)),
+      selectizeInput("yvar", "Endogenous variable (FRED‑QD, raw → auto‑transform):",
+                     choices = NULL, multiple = FALSE,
+                     options = list(placeholder = 'Type to search…', maxOptions = 2000)),
+      checkboxGroupInput("controls", "Controls (lagged):",
+                         choices  = list(GDPC1="GDPC1", GDPDEF="GDPDEF", FEDFUNDS="FEDFUNDS", UNRATE="UNRATE"),
+                         selected = c("GDPC1","GDPDEF","FEDFUNDS","UNRATE")),
+      hr(),
+      numericInput("H", "Max horizon H (quarters):", value = 16, min = 4, max = 24, step = 1),
+      numericInput("pl", "Lags of y (p):", value = 4, min = 1, max = 8, step = 1),
+      numericInput("ql", "Lags of shock (q):", value = 4, min = 1, max = 8, step = 1),
+      numericInput("cl", "Lags of each control (c):", value = 4, min = 1, max = 8, step = 1),
+      checkboxInput("cumul", "Show cumulative IRFs", value = FALSE),
+      checkboxInput("prewhite", "HAC prewhitening (fallback if unstable)", value = FALSE),
+      hr(),
+      actionButton("recalc", "Estimate IRFs"),
+      downloadButton("savepng", "Save two‑panel IRF as PNG")
+    ),
+    mainPanel(
+      width = 8,
+      p(em("Shock series:"), " CY_10Y constructed in levels from the raw snapshot; y and controls auto‑transformed."),
+      fluidRow(
+        column(6, plotOutput("irf_plot", height = 380)),
+        column(6, uiOutput("ext_panel"))
+      ),
+      br(),
+      tableOutput("beta_table")
+    )
+  )
+)
+
+server <- function(input, output, session) {
+  
+  prepared <- prep_data()
+  df_all <- prepared$df
+  output$datasrc  <- renderText(prepared$source)
+  output$shocklbl <- renderText(prepared$shock_label)
+  output$extsrc   <- renderText(paste0(prepared$ext_label, " — ", prepared$ext_source))
+  output$samplestr<- renderText(prepared$sample_info)
+  
+  updateSelectizeInput(session, "yvar",
+                       choices = prepared$choices,
+                       selected = if ("GDPC1" %in% prepared$choices) "GDPC1" else prepared$choices[1],
+                       server = TRUE)
+  
+  current_irf <- eventReactive(input$recalc, {
+    req(input$yvar, input$H, input$pl, input$ql, input$cl)
+    validate(need("CY_10Y" %in% names(df_all), "CY_10Y could not be constructed."))
+    lp_irf(
+      data_raw   = df_all,
+      y          = input$yvar,
+      shock      = "CY_10Y",
+      controls   = input$controls,
+      H          = input$H,
+      p_lags     = input$pl,
+      q_lags     = input$ql,
+      c_lags     = input$cl,
+      cumulative = input$cumul,
+      nw_prewhite = input$prewhite
+    )
+  }, ignoreInit = FALSE)
+  
+  output$irf_plot <- renderPlot({
+    req(input$yvar)
+    irf <- current_irf()
+    yl <- if (input$cumul) paste0("Cumulative response of ", input$yvar) else paste0("Response of ", input$yvar)
+    ggplot2::ggplot(irf, ggplot2::aes(h, beta)) +
+      ggplot2::geom_ribbon(ggplot2::aes(ymin = ci95_lo, ymax = ci95_hi), alpha = 0.15) +
+      ggplot2::geom_ribbon(ggplot2::aes(ymin = ci68_lo, ymax = ci68_hi), alpha = 0.25) +
+      ggplot2::geom_hline(yintercept = 0, linewidth = 0.3) +
+      ggplot2::geom_line(linewidth = 0.7) +
+      ggplot2::labs(x = "Horizon (quarters)", y = yl,
+                    title = paste0("Local‑Projection IRF: ", input$yvar, " ← CY_10Y"),
+                    subtitle = paste0("Controls lagged; HAC (Newey‑West) SEs; shaded = 68% & 95% CIs; ",
+                                      if (input$cumul) "cumulative" else "point‑in‑time")) +
+      ggplot2::theme_minimal(base_size = 12) +
+      ggplot2::theme(panel.grid.minor = element_blank(),
+                     plot.title.position = "plot",
+                     plot.caption.position = "plot")
+  })
+  
+  # External panel: NX share (offline); treat as levels (force_level_y = TRUE)
+  output$ext_panel <- renderUI({
+    if (!prepared$ext_avail) {
+      div(style="padding:10px; background:#fff1f0; border:1px solid #ffd6d6; border-radius:6px;",
+          strong("External series not available with sufficient overlap."),
+          p("Snapshot lacks a usable NX share."))
+    } else {
+      plotOutput("ext_irf_plot", height = 380)
+    }
+  })
+  
+  current_ext_irf <- eventReactive(input$recalc, {
+    if (!prepared$ext_avail) return(NULL)
+    lp_irf(
+      data_raw   = df_all,
+      y          = "EXT_VAR",
+      shock      = "CY_10Y",
+      controls   = input$controls,
+      H          = input$H,
+      p_lags     = input$pl,
+      q_lags     = input$ql,
+      c_lags     = input$cl,
+      cumulative = input$cumul,
+      nw_prewhite = input$prewhite,
+      force_level_y = TRUE
+    )
+  }, ignoreInit = FALSE)
+  
+  output$ext_irf_plot <- renderPlot({
+    req(prepared$ext_avail)
+    irf <- current_ext_irf(); req(!is.null(irf))
+    yl <- if (input$cumul) "External: cumulative change" else "External: change"
+    ggplot2::ggplot(irf, ggplot2::aes(h, beta)) +
+      ggplot2::geom_ribbon(ggplot2::aes(ymin = ci95_lo, ymax = ci95_hi), alpha = 0.15) +
+      ggplot2::geom_ribbon(ggplot2::aes(ymin = ci68_lo, ymax = ci68_hi), alpha = 0.25) +
+      ggplot2::geom_hline(yintercept = 0, linewidth = 0.3) +
+      ggplot2::geom_line(linewidth = 0.7) +
+      ggplot2::labs(x = "Horizon (quarters)", y = yl,
+                    title = paste0("External Channel IRF: ", prepared$ext_label, " ← CY_10Y"),
+                    subtitle = paste0(prepared$ext_source, "; HAC (Newey‑West) SEs; ",
+                                      if (input$cumul) "cumulative" else "point‑in‑time")) +
+      ggplot2::theme_minimal(base_size = 12) +
+      ggplot2::theme(panel.grid.minor = element_blank(),
+                     plot.title.position = "plot",
+                     plot.caption.position = "plot")
+  })
+  
+  # Numeric table for the domestic IRF
+  output$beta_table <- renderTable({
+    current_irf() %>%
+      dplyr::transmute(h,
+                       beta   = round(beta, 3),
+                       se     = round(se, 3),
+                       ci95_lo= round(ci95_lo, 3),
+                       ci95_hi= round(ci95_hi, 3))
+  })
+  
+  # Two‑panel PNG export
+  output$savepng <- downloadHandler(
+    filename = function() paste0("IRF_", input$yvar, "_and_EXTERNAL_", if (input$cumul) "cumulative" else "point", ".png"),
+    content = function(file) {
+      p_dom <- {
+        irf <- isolate(current_irf())
+        ggplot2::ggplot(irf, ggplot2::aes(h, beta)) +
+          ggplot2::geom_ribbon(ggplot2::aes(ymin = ci95_lo, ymax = ci95_hi), alpha = 0.15) +
+          ggplot2::geom_ribbon(ggplot2::aes(ymin = ci68_lo, ymax = ci68_hi), alpha = 0.25) +
+          ggplot2::geom_hline(yintercept = 0, linewidth = 0.3) +
+          ggplot2::geom_line(linewidth = 0.7) +
+          ggplot2::labs(x = "Horizon (quarters)",
+                        y = if (input$cumul) paste0("Cumulative response of ", input$yvar) else paste0("Response of ", input$yvar),
+                        title = paste0("Local‑Projection IRF: ", input$yvar, " ← CY_10Y")) +
+          ggplot2::theme_minimal(base_size = 12) +
+          ggplot2::theme(panel.grid.minor = element_blank())
+      }
+      p_ext <- if (prepared$ext_avail) {
+        irf2 <- isolate(current_ext_irf())
+        ggplot2::ggplot(irf2, ggplot2::aes(h, beta)) +
+          ggplot2::geom_ribbon(ggplot2::aes(ymin = ci95_lo, ymax = ci95_hi), alpha = 0.15) +
+          ggplot2::geom_ribbon(ggplot2::aes(ymin = ci68_lo, ymax = ci68_hi), alpha = 0.25) +
+          ggplot2::geom_hline(yintercept = 0, linewidth = 0.3) +
+          ggplot2::geom_line(linewidth = 0.7) +
+          ggplot2::labs(x = "Horizon (quarters)",
+                        y = if (input$cumul) "External: cumulative change" else "External: change",
+                        title = paste0("External Channel IRF: ", prepared$ext_label, " ← CY_10Y")) +
+          ggplot2::theme_minimal(base_size = 12) +
+          ggplot2::theme(panel.grid.minor = element_blank())
+      } else NULL
+      
+      fig <- if (is.null(p_ext)) p_dom else (p_dom | p_ext)
+      ggsave(file, fig, width = if (is.null(p_ext)) 8.5 else 11, height = 5.25, dpi = 300)
+    }
+  )
+}
+
+shinyApp(ui, server)
+
+#--------------------------------To Do------------------------------------------
+# 1. Familiarize yourself with the handout on the convenience yield. In your own
+#    words, what do you expect will happen when the convenience yield unexpectedly
+#    rises? What does it mean about the "specialness" of Treasuries when there is
+#    such a positive shock?
+# 2. How does the Federal Reserve respond when Treasuries become more special? [Hint:
+#    look at FEDFUNDS as your endogenous variable and think through what that IRF
+#    movement implies about monetary policy].
+# 3. When we control for lags of GDPC1 in our impulse response curve, do changes in
+#    the convenience yield drive meaningful business cycles?
+# 4. What happens to inflation/prices when the convenience yield rises? Can you come
+#    up with a hypothesis for why? What did our data provocation say about this?
+# 5. What happens to Net Exports as a share of GDP (the right plot) when the
+#    convenience yield rises? Can you use what you know about how current accounts
+#    relate to net exports to hypothesize why this is the case?
+# 6. Are there any surprising variables which the convenience yield affects? Do some
+#    exploring in the endogenous variables drop down menu to find out.
+# 7. Data you have to pay for suggests that the convenience yield has been declining
+#    steadily since the 2000s. What might that mean for dollar-dominance, the cost
+#    of financing new public debt (remember Treasuries are the main way we raise funds),
+#    and the sustainability of persistent deficits? How does real government debt
+#    (GFDEBTNx) respond to a shrinking convenience yield [Hint: read the IRF flipped over
+#    the x-axis!]
